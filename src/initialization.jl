@@ -42,12 +42,68 @@ struct OverrideInitData{
     is_update_oop::OOP
 
     function OverrideInitData(initprob::I, update_initprob!::J, initprobmap::K,
-            initprobpmap::L, metadata::M, is_update_oop::O) where {I, J, K, L, M, O}
+            initprobpmap::L, metadata::M, ::Val{true}) where {I, J, K, L, M}
         @assert initprob isa
                 Union{SCCNonlinearProblem, NonlinearProblem, NonlinearLeastSquaresProblem}
-        return new{I, J, K, L, M, O}(
-            initprob, update_initprob!, initprobmap, initprobpmap, metadata, is_update_oop)
+        initprobmap = InitprobmapWrapper(initprobmap)
+        initprobpmap = InitprobpmapWrapper(initprobpmap)
+        return new{I, J, typeof(initprobmap), typeof(initprobpmap), M, Val{true}}(
+            initprob, update_initprob!, initprobmap, initprobpmap, metadata, Val(true))
     end
+
+    function OverrideInitData(initprob::I, update_initprob!, initprobmap::K,
+            initprobpmap::L, metadata::M, ::Val{false}) where {I, K, L, M}
+        @assert initprob isa
+                Union{SCCNonlinearProblem, NonlinearProblem, NonlinearLeastSquaresProblem}
+        update_initprob! = UpdateInitprobWrapper(update_initprob!)
+        initprobmap = InitprobmapWrapper(initprobmap)
+        initprobpmap = InitprobpmapWrapper(initprobpmap)
+        return new{I, typeof(update_initprob!), typeof(initprobmap), typeof(initprobpmap), M, Val{true}}(
+            initprob, update_initprob!, initprobmap, initprobpmap, metadata, Val(true))
+    end
+end
+
+struct UpdateInitprobWrapper{F}
+    f::F
+end
+
+UpdateInitprobWrapper(f::UpdateInitprobWrapper) = f
+
+function (w::UpdateInitprobWrapper)(initprob, valp)
+    w.f(initprob, valp)
+    initprob
+end
+
+function (w::UpdateInitprobWrapper{Nothing})(initprob, valp)
+    return initprob
+end
+
+struct InitprobmapWrapper{F}
+    f::F
+end
+
+InitprobmapWrapper(f::InitprobmapWrapper) = f
+
+function (w::InitprobmapWrapper)(valp, initsol)
+    return w.f(initsol)
+end
+
+function (w::InitprobmapWrapper{Nothing})(valp, initsol)
+    return state_values(valp)
+end
+
+struct InitprobpmapWrapper{F}
+    f::F
+end
+
+InitprobpmapWrapper(f::InitprobpmapWrapper) = f
+
+function (w::InitprobpmapWrapper)(valp, initsol)
+    return w.f(valp, initsol)
+end
+
+function (w::InitprobpmapWrapper{Nothing})(valp, initsol)
+    return parameter_values(valp)
 end
 
 function OverrideInitData(
@@ -249,58 +305,44 @@ function get_initial_values(prob, valp, f, alg::OverrideInit,
     end
 
     initdata::OverrideInitData = f.initialization_data
-    initprob = initdata.initializeprob
+    initprob = initdata.update_initializeprob!(initdata.initializeprob, valp)
 
-    if initdata.update_initializeprob! !== nothing
-        if initdata.is_update_oop === Val(true)
-            initprob = initdata.update_initializeprob!(initprob, valp)
-        else
-            initdata.update_initializeprob!(initprob, valp)
-        end
+    nlsolve_alg = something(nlsolve_alg, alg.nlsolve, Some(nothing))
+    if nlsolve_alg === nothing && state_values(initprob) !== nothing && !is_trivial_initialization(initdata)
+        throw(OverrideInitMissingAlgorithm())
     end
-
-    if is_trivial_initialization(initdata)
-        nlsol = initdata
-        success = true
+    if alg.abstol !== nothing
+        _abstol = alg.abstol
+    elseif abstol !== nothing
+        _abstol = abstol
+    elseif is_trivial_initialization(initdata)
+        _abstol = 0.0
     else
-        nlsolve_alg = something(nlsolve_alg, alg.nlsolve, Some(nothing))
-        if nlsolve_alg === nothing && state_values(initprob) !== nothing
-            throw(OverrideInitMissingAlgorithm())
-        end
-        if alg.abstol !== nothing
-            _abstol = alg.abstol
-        elseif abstol !== nothing
-            _abstol = abstol
-        else
-            throw(OverrideInitNoTolerance(:abstol))
-        end
-        if alg.reltol !== nothing
-            _reltol = alg.reltol
-        elseif reltol !== nothing
-            _reltol = reltol
-        else
-            throw(OverrideInitNoTolerance(:reltol))
-        end
-        nlsol = solve(initprob, nlsolve_alg; abstol = _abstol, reltol = _reltol, kwargs...)
+        throw(OverrideInitNoTolerance(:abstol))
+    end
+    if alg.reltol !== nothing
+        _reltol = alg.reltol
+    elseif reltol !== nothing
+        _reltol = reltol
+    elseif is_trivial_initialization(initdata)
+        _reltol = 0.0
+    else
+        throw(OverrideInitNoTolerance(:reltol))
+    end
+    nlsol = solve(initprob, nlsolve_alg; abstol = _abstol, reltol = _reltol, kwargs...)
 
-        success = if initprob isa NonlinearLeastSquaresProblem
-            # Do not accept StalledSuccess as a solution
-            # A good local minima is not a success 
-            resid = nlsol.resid
-            normresid = norm(resid)
-            SciMLBase.successful_retcode(nlsol) && normresid <= abstol
-        else
-            SciMLBase.successful_retcode(nlsol)
-        end
+    success = if initprob isa NonlinearLeastSquaresProblem
+        # Do not accept StalledSuccess as a solution
+        # A good local minima is not a success 
+        resid = nlsol.resid
+        normresid = norm(resid)
+        SciMLBase.successful_retcode(nlsol) && normresid <= abstol
+    else
+        SciMLBase.successful_retcode(nlsol)
     end
 
-    if initdata.initializeprobmap !== nothing
-        u0 = initdata.initializeprobmap(choose_branch(nlsol))
-    end
-    if initdata.initializeprobpmap !== nothing
-        p = initdata.initializeprobpmap(valp, choose_branch(nlsol))
-    end
-
+    u0 = initdata.initializeprobmap(valp, nlsol)
+    p = initdata.initializeprobpmap(valp, nlsol)
     return u0, p, success
 end
 
